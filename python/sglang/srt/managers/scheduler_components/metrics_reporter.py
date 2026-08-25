@@ -1011,6 +1011,34 @@ class SchedulerMetricsReporter:
             host_pool.size - host_pool.available_size()
         )
         self.stats.hicache_host_total_tokens = host_pool.size
+        pool_group = getattr(
+            getattr(self.scheduler.tree_cache, "cache_controller", None),
+            "mem_pool_host",
+            None,
+        )
+        entries = getattr(pool_group, "entries", None) or []
+        pools = (
+            [(str(entry.name), entry.host_pool) for entry in entries]
+            if entries
+            else [("kv", host_pool)]
+        )
+        for pool_name, pool in pools:
+            # телеметрия не имеет права ронять планировщик: у state-сайдкаров DSV4
+            # available_size() штатно бросает NotImplementedError, а любой иной отказ
+            # пула вышел бы в обработчик scheduler и убил бы процесс через SIGQUIT
+            try:
+                available_size = pool.available_size()
+            except NotImplementedError:
+                continue
+            except Exception as exc:
+                logger.warning(
+                    "HiCache pool metrics skipped: pool=%s error=%s", pool_name, exc
+                )
+                continue
+            self.stats.hicache_host_pool_used_tokens[pool_name] = (
+                pool.size - available_size
+            )
+            self.stats.hicache_host_pool_total_tokens[pool_name] = pool.size
 
     def _update_lora_metrics(self):
         """Update LoRA pool metrics for monitoring and autoscaling."""

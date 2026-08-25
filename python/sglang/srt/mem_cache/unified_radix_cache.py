@@ -75,6 +75,44 @@ if TYPE_CHECKING:
 
 T = TypeVar("T")
 
+_LOADBACK_LOG_INTERVAL_SECONDS = 1.0
+_loadback_entry_log_time = 0.0
+_loadback_outcome_log_time = 0.0
+
+
+def _log_loadback_entry(requested_tokens: int, full_available_tokens: int) -> None:
+    """Записывает ограниченную по частоте диагностику входа load_back."""
+    global _loadback_entry_log_time
+    try:
+        current_time = time.monotonic()
+        if current_time - _loadback_entry_log_time < _LOADBACK_LOG_INTERVAL_SECONDS:
+            return
+        _loadback_entry_log_time = current_time
+        logger.info(
+            "LOADBACK_PATH stage=entry requested_tokens=%d full_available_tokens=%d",
+            requested_tokens,
+            full_available_tokens,
+        )
+    except Exception:
+        return
+
+
+def _log_loadback_outcome(outcome: str, requested_tokens: int | None = None) -> None:
+    """Записывает ограниченную по частоте результат диагностики load_back."""
+    global _loadback_outcome_log_time
+    try:
+        current_time = time.monotonic()
+        if current_time - _loadback_outcome_log_time < _LOADBACK_LOG_INTERVAL_SECONDS:
+            return
+        _loadback_outcome_log_time = current_time
+        logger.info(
+            "LOADBACK_PATH stage=outcome outcome=%s requested_tokens=%s",
+            outcome,
+            requested_tokens,
+        )
+    except Exception:
+        return
+
 
 class UnifiedTreeNode:
     counter = 0
@@ -1668,6 +1706,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     ) -> bool:
         """Load evicted KV data from host back to device (H→D)."""
         if self.cache_controller is None:
+            _log_loadback_outcome("cache_controller_missing")
             return False
 
         host_anchor_params = self.inc_host_lock_ref(best_match_node).to_dec_params()
@@ -1680,6 +1719,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         result = self.inc_lock_ref(best_match_node)
         ancestor_lock_params = result.to_dec_params()
         kv_tokens = len(kv_xfer.host_indices)
+
+        try:
+            if self.supports_swa():
+                full_available_tokens = (
+                    self.token_to_kv_pool_allocator.full_available_size()
+                )
+            else:
+                full_available_tokens = self.token_to_kv_pool_allocator.available_size()
+            _log_loadback_entry(kv_tokens, full_available_tokens)
+        except Exception:
+            pass
 
         # Build aux transfers, keyed per component.
         comp_xfers: dict[ComponentType, list] = {}
@@ -1698,9 +1748,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # Skip if there is nothing to load, or if the Full-KV transfer is too
         # small / exceeds memory quota. Aux transfers should still run even
         # when the Full-KV load is skipped by thresholding.
-        if (kv_tokens < self.load_back_threshold and not comp_xfers) or (
+        below_threshold = kv_tokens < self.load_back_threshold and not comp_xfers
+        exceeds_memory_quota = (
             mem_quota is not None and kv_tokens > mem_quota + result.delta
-        ):
+        )
+        if below_threshold or exceeds_memory_quota:
+            _log_loadback_outcome(
+                "below_threshold" if below_threshold else "memory_quota_exceeded",
+                kv_tokens,
+            )
             self.dec_lock_ref(best_match_node, ancestor_lock_params)
             self.dec_host_lock_ref(best_match_node, host_anchor_params)
             return False
@@ -1713,6 +1769,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             needed = kv_tokens - avail
             result = self.evict(EvictParams(num_tokens=needed))
             if result.num_tokens_evicted < needed:
+                _log_loadback_outcome("insufficient_full_eviction", kv_tokens)
                 self.dec_lock_ref(best_match_node, ancestor_lock_params)
                 self.dec_host_lock_ref(best_match_node, host_anchor_params)
                 return False
@@ -1728,6 +1785,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         self.dec_lock_ref(best_match_node, ancestor_lock_params)
         if device_indices is None:
+            _log_loadback_outcome("cache_controller_load_returned_none", kv_tokens)
             self.dec_host_lock_ref(best_match_node, host_anchor_params)
             return False
 
@@ -1753,6 +1811,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.inc_lock_ref(best_match_node).to_dec_params(),
             host_anchor_params,
         )
+
+        _log_loadback_outcome("success", kv_tokens)
 
         return True
 

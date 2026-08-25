@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from array import array
 
 from sglang.srt.environ import envs
@@ -9,6 +10,28 @@ from sglang.srt.utils import get_bool_env_var
 
 _ROUTING_KEY_POLICY_DEBUG_LOG = get_bool_env_var("SGLANG_ROUTING_KEY_POLICY_DEBUG_LOG")
 logger = logging.getLogger(__name__)
+_LOADBACK_GATE_LOG_INTERVAL_SECONDS = 1.0
+_loadback_gate_log_time = 0.0
+
+
+def _log_loadback_gate(req: Req, gate_triggered: bool) -> None:
+    """Записывает ограниченную по частоте диагностику гейта load_back."""
+    global _loadback_gate_log_time
+    try:
+        current_time = time.monotonic()
+        if current_time - _loadback_gate_log_time < _LOADBACK_GATE_LOG_INTERVAL_SECONDS:
+            return
+        _loadback_gate_log_time = current_time
+        logger.info(
+            "LOADBACK_GATE host_hit_length=%d swa_host_hit_length=%d "
+            "mamba_host_hit_length=%d triggered=%s",
+            req.host_hit_length,
+            req.swa_host_hit_length,
+            req.mamba_host_hit_length,
+            gate_triggered,
+        )
+    except Exception:
+        return
 
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -1086,7 +1109,9 @@ class PrefillAdder:
                         return AddReqResult.NO_TOKEN
                     chunk_tokens_limit = min(self.rem_chunk_tokens, swa_cap)
 
-            if req.needs_host_load_back():
+            needs_host_load_back = req.needs_host_load_back()
+            _log_loadback_gate(req, needs_host_load_back)
+            if needs_host_load_back:
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     InitLoadBackParams(
                         best_match_node=req.best_match_node,
