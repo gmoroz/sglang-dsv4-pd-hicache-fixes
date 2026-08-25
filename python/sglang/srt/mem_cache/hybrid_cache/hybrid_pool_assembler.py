@@ -415,6 +415,7 @@ def build_deepseek_v4_hicache_stack(
                     device_pool=kvcache.c4_kv_pool,
                     layer_mapping=c4_layer_mapping,
                     transfer_layer_num=transfer_layer_num,
+                    host_evict_fn=lambda n: cache.evict_host(n, ComponentType.FULL),
                 ),
                 build_pool_entry(
                     name=PoolName.DEEPSEEK_V4_C4_INDEXER,
@@ -422,6 +423,7 @@ def build_deepseek_v4_hicache_stack(
                     device_pool=kvcache.c4_indexer_kv_pool,
                     layer_mapping=c4_layer_mapping,
                     transfer_layer_num=transfer_layer_num,
+                    host_evict_fn=lambda n: cache.evict_host(n, ComponentType.FULL),
                 ),
             ]
         )
@@ -491,6 +493,7 @@ def build_deepseek_v4_hicache_stack(
                     device_pool=kvcache.c128_kv_pool,
                     layer_mapping=c128_layer_mapping,
                     transfer_layer_num=transfer_layer_num,
+                    host_evict_fn=lambda n: cache.evict_host(n, ComponentType.FULL),
                 ),
             ]
         )

@@ -146,6 +146,8 @@ class SchedulerStats:
     # HiCache metrics
     hicache_host_used_tokens: int = 0
     hicache_host_total_tokens: int = 0
+    hicache_host_pool_used_tokens: dict[str, int] = field(default_factory=dict)
+    hicache_host_pool_total_tokens: dict[str, int] = field(default_factory=dict)
 
     # Streaming session metrics
     num_streaming_sessions: int = 0
@@ -639,6 +641,18 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 name="sglang:hicache_host_total_tokens",
                 documentation="Total capacity of the host KV cache in tokens.",
                 labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            self.hicache_host_pool_used_tokens = Gauge(
+                name="sglang:hicache_host_pool_used_tokens",
+                documentation="Number of tokens used in each HiCache host pool.",
+                labelnames=[*labels.keys(), "pool"],
+                multiprocess_mode="mostrecent",
+            )
+            self.hicache_host_pool_total_tokens = Gauge(
+                name="sglang:hicache_host_pool_total_tokens",
+                documentation="Capacity in tokens of each HiCache host pool.",
+                labelnames=[*labels.keys(), "pool"],
                 multiprocess_mode="mostrecent",
             )
 
@@ -1352,6 +1366,14 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             self._log_gauge(
                 self.hicache_host_total_tokens, stats.hicache_host_total_tokens
             )
+            for pool, value in stats.hicache_host_pool_used_tokens.items():
+                self.hicache_host_pool_used_tokens.labels(
+                    **self.labels, pool=pool
+                ).set(value)
+            for pool, value in stats.hicache_host_pool_total_tokens.items():
+                self.hicache_host_pool_total_tokens.labels(
+                    **self.labels, pool=pool
+                ).set(value)
 
         # Streaming session metrics
         if self.enable_streaming_session:

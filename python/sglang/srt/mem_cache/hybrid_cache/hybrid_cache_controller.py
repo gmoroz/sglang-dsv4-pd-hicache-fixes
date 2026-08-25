@@ -370,6 +370,12 @@ class HybridCacheController(BaseHiCacheController):
     ) -> Optional[torch.Tensor]:
         host_indices = self.mem_pool_host.alloc(len(device_indices))
         if host_indices is None:
+            logger.warning(
+                "HiCache write_backup allocation failed: pool=%s requested=%d available=%d",
+                PoolName.KV,
+                len(device_indices),
+                self.mem_pool_host.available_size(),
+            )
             return None
         pool_transfers = self._resolve_pool_transfers_allocation(
             extra_pools,
@@ -748,7 +754,13 @@ class HybridCacheController(BaseHiCacheController):
                 continue
             entry = self.mem_pool_host.entry_map.get(pool.name)
             if entry is None:
-                continue
+                logger.warning(
+                    "HiCache write_backup allocation failed: pool=%s requested=%d available=unknown",
+                    pool.name,
+                    len(pool.device_indices) if alloc_host else len(pool.host_indices),
+                )
+                rollback_allocated()
+                return None
             if alloc_host:
                 if pool.host_indices is not None or pool.device_indices is None:
                     continue
@@ -771,6 +783,17 @@ class HybridCacheController(BaseHiCacheController):
                 evict_fn(size)
                 indices = alloc_fn(size)
             if indices is None:
+                available = (
+                    entry.host_pool.available_size()
+                    if alloc_host
+                    else getattr(entry.device_pool, "available_size", lambda: -1)()
+                )
+                logger.warning(
+                    "HiCache write_backup allocation failed: pool=%s requested=%d available=%d",
+                    pool.name,
+                    size,
+                    available,
+                )
                 # Atomic rollback: free everything we successfully allocated.
                 rollback_allocated()
                 return None
