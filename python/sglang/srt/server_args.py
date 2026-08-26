@@ -2205,6 +2205,10 @@ class ServerArgs:
         float,
         "The ratio of the size of host KV cache memory pool to the size of device pool.",
     ] = 2.0
+    hicache_swa_ratio: A[
+        float | None,
+        "DeepSeek V4 SWA host-pool ratio; defaults to hicache_ratio.",
+    ] = None
     hicache_size: A[
         int,
         "The size of host KV cache memory pool in gigabytes, which will override the hicache_ratio if set.",

@@ -252,7 +252,7 @@ def _deepseek_v4_num_host_pages(
     kvcache: Any,
     page_size: int,
     swa_page_size: int,
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
     allocator = params.token_to_kv_pool_allocator
     device_full_size = getattr(allocator, "size_full", kvcache.size)
     device_full_pages = (device_full_size + page_size - 1) // page_size
@@ -265,9 +265,13 @@ def _deepseek_v4_num_host_pages(
             "use --hicache-ratio instead."
         )
     ratio = server_args.hicache_ratio
+    swa_ratio = getattr(server_args, "hicache_swa_ratio", None)
+    if swa_ratio is None:
+        swa_ratio = ratio
     full_host_pages = int(device_full_pages * ratio)
-    swa_host_pages = int(device_swa_pages * ratio)
-    return full_host_pages, swa_host_pages
+    swa_host_pages = int(device_swa_pages * swa_ratio)
+    state_host_pages = int(device_swa_pages * ratio)
+    return full_host_pages, swa_host_pages, state_host_pages
 
 
 def _dsv4_compressed_region_buffers(kvcache: Any, ratio: int) -> tuple[list, int]:
@@ -338,7 +342,7 @@ def build_deepseek_v4_hicache_stack(
     c4_state_mapping = {
         layer_id: local_id for local_id, layer_id in enumerate(c4_state_local_layers)
     }
-    num_host_pages, swa_num_host_pages = _deepseek_v4_num_host_pages(
+    num_host_pages, swa_num_host_pages, state_num_host_pages = _deepseek_v4_num_host_pages(
         params=params,
         server_args=server_args,
         kvcache=kvcache,
@@ -436,7 +440,7 @@ def build_deepseek_v4_hicache_stack(
                     kvcache.compress_state_pools[layer_id]
                     for layer_id in c4_state_global_layers
                 ],
-                num_host_pages=swa_num_host_pages,
+                num_host_pages=state_num_host_pages,
                 swa_page_size=kvcache.swa_page_size,
                 layout=server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
@@ -447,7 +451,7 @@ def build_deepseek_v4_hicache_stack(
                     kvcache.indexer_compress_state_pools[layer_id]
                     for layer_id in c4_state_global_layers
                 ],
-                num_host_pages=swa_num_host_pages,
+                num_host_pages=state_num_host_pages,
                 swa_page_size=kvcache.swa_page_size,
                 layout=server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
@@ -860,7 +864,7 @@ class _DeepSeekV4Strategy(StackStrategy):
             pp_group=params.pp_cache_group,
             storage_backend=storage_backend,
             host_full_evict_fn=lambda n: cache.evict_host(n, ComponentType.FULL),
-            host_swa_evict_fn=lambda n: cache.evict_host(n, ComponentType.SWA),
+            host_swa_evict_fn=cache.evict_host_coordinated,
             device_swa_evict_fn=lambda n: cache.evict(EvictParams(swa_num_tokens=n)),
             prefetch_threshold=prefetch_threshold,
             model_name=model_name,

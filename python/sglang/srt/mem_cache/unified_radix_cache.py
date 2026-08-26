@@ -1414,9 +1414,56 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     ) -> int:
         """Evict host resources for a specific component to free host pool space."""
         tracker: dict[ComponentType, int] = {ct: 0 for ct in self.tree_components}
+        if (
+            component_type == ComponentType.SWA
+            and ComponentType.FULL in self.tree_components
+            and ComponentType.SWA in self.tree_components
+        ):
+            return self.evict_host_coordinated(num_tokens, component_type)
         comp = self.components.get(component_type)
         if comp is not None:
             comp.drive_host_eviction(num_tokens, tracker)
+        return tracker[component_type]
+
+    def evict_host_coordinated(
+        self, num_tokens: int, component_type: ComponentType = ComponentType.SWA
+    ) -> int:
+        """Evict paired FULL/SWA host copies for a hybrid cache node."""
+        tracker: dict[ComponentType, int] = {ct: 0 for ct in self.tree_components}
+        candidates: list[UnifiedTreeNode] = []
+        swa_lru = self.host_lru_lists[ComponentType.SWA]
+        node = swa_lru.get_lru_no_host_lock()
+        while node is not None and swa_lru.in_list(node):
+            candidates.append(node)
+            node = swa_lru.get_prev_no_host_lock(node)
+        candidates.sort(key=self.eviction_strategy.get_priority)
+        for node in candidates:
+            if tracker[component_type] >= num_tokens:
+                break
+            if node.parent is None:
+                continue
+            if node.component_data[ComponentType.SWA].host_value is None:
+                if swa_lru.in_list(node):
+                    swa_lru.remove_node(node)
+                continue
+            if any(data.host_lock_ref > 0 for data in node.component_data):
+                continue
+            if self._is_host_leaf(node):
+                self._evict_host_leaf(node, tracker)
+                continue
+            trigger = self.components[ComponentType.FULL]
+            self._evict_component_and_detach_lru(
+                node, trigger, target=EvictLayer.HOST, tracker=tracker
+            )
+            self._cascade_evict(
+                node,
+                trigger,
+                tracker,
+                target=EvictLayer.HOST,
+            )
+            self._for_each_component_lru(
+                node, UnifiedLRUList.insert_mru, skip_existing=True
+            )
         return tracker[component_type]
 
     def _is_device_leaf(self, node: UnifiedTreeNode) -> bool:
