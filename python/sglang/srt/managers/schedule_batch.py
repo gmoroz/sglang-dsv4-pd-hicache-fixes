@@ -126,6 +126,11 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
+REPETITION_MIN_PERIOD = 4
+REPETITION_MAX_PERIOD = 64
+REPETITION_REQUIRED_REPEATS = 5
+REPETITION_CHECK_INTERVAL = 32
+REPETITION_TAIL_MAX_LEN = REPETITION_MAX_PERIOD * REPETITION_REQUIRED_REPEATS
 
 # Constant used as the base offset for MM (multimodal) pad values.
 # This ensures pad_values don't overlap with valid text token IDs.
@@ -147,6 +152,28 @@ def sanity_check_mm_pad_shift_value(vocab_size: int) -> None:
 def _compute_pad_value(hash: int) -> int:
     """Compute pad value from hash."""
     return MM_PAD_SHIFT_VALUE + (hash % (1 << 30))
+
+
+def _has_repeated_tail(token_ids: array) -> bool:
+    tail = token_ids[-REPETITION_TAIL_MAX_LEN:]
+    for period in range(REPETITION_MIN_PERIOD, REPETITION_MAX_PERIOD + 1):
+        repeated_len = period * REPETITION_REQUIRED_REPEATS
+        if len(tail) < repeated_len:
+            continue
+        repeated_tail = tail[-repeated_len:]
+        pattern = repeated_tail[:period]
+        if any(
+            period % divisor == 0
+            and pattern == pattern[:divisor] * (period // divisor)
+            for divisor in range(1, period)
+        ):
+            continue
+        if all(
+            repeated_tail[offset : offset + period] == pattern
+            for offset in range(period, repeated_len, period)
+        ):
+            return True
+    return False
 
 
 class BaseFinishReason:
@@ -860,6 +887,7 @@ class Req(ReqDllmMixin):
         # set to_finish instead of directly setting finished_reason.
         # Note: We should never set finished_reason in the middle, the req will get filtered and never respond
         self.to_finish: Optional[BaseFinishReason] = None
+        self._repetition_tokens_since_check = 0
         self.stream = stream
         self.eos_token_ids = eos_token_ids
         self.vocab_size = vocab_size
@@ -1473,6 +1501,23 @@ class Req(ReqDllmMixin):
 
         return False
 
+    def _check_repetition_finish(self, new_accepted_len: int) -> bool:
+        self._repetition_tokens_since_check += new_accepted_len
+        if self._repetition_tokens_since_check < REPETITION_CHECK_INTERVAL:
+            return False
+        self._repetition_tokens_since_check %= REPETITION_CHECK_INTERVAL
+
+        if _has_repeated_tail(self.output_ids):
+            # Причина "length", а не "stop": ход оборван и НЕ завершён по смыслу. При "stop"
+            # агент считает огрызок нормальным ответом и идёт дальше с тем же контекстом,
+            # который только что вызвал срыв. Поле matched_stop до клиента не доходит --
+            # адаптер continue-dev его не сериализует, -- поэтому единственный доступный
+            # признак это сам finish_reason.
+            self.finished_reason = FINISH_LENGTH(length=len(self.output_ids))
+            self.finished_len = len(self.output_ids)
+            return True
+        return False
+
     def update_finish_state(self, new_accepted_len: int = 1):
         if self.finished():
             return
@@ -1508,6 +1553,8 @@ class Req(ReqDllmMixin):
 
         if self._check_token_based_finish(new_accepted_tokens):
             return
+
+        self._check_repetition_finish(new_accepted_len)
 
     def reset_for_retract(self):
         # Increment retraction count before resetting other state. We should not reset this

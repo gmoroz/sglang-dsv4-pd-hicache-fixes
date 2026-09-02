@@ -142,6 +142,8 @@ class FunctionCallParser:
         has_tool_call = self.detector.has_tool_call(full_text)
         parsed_result = self.detector.detect_and_parse(full_text, self.tools)
         tool_call_list = parsed_result.calls
+        if has_tool_call and not tool_call_list and not parsed_result.normal_text:
+            return full_text, []
         if tool_call_list or has_tool_call:
             return parsed_result.normal_text, tool_call_list
         else:

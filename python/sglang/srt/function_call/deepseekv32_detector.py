@@ -205,10 +205,13 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 text,
                 re.DOTALL,
             )
-            if not function_calls_match:
+            if function_calls_match:
+                function_calls_content = function_calls_match.group(1)
+            elif self.invoke_end_token in text and self.eot_token not in text:
+                # Тело вызова уже целое, поэтому извлекаем его даже без внешнего маркера.
+                function_calls_content = text.split(self.bot_token, 1)[1]
+            else:
                 return StreamingParseResult(normal_text=normal_text, calls=[])
-
-            function_calls_content = function_calls_match.group(1)
 
             # Find all invoke blocks
             for invoke_match in re.finditer(

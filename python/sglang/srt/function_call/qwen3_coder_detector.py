@@ -179,10 +179,11 @@ class Qwen3CoderDetector(BaseFormatDetector):
             # Simple cleanup of the text to find tool calls
             # Note: This is a simplified regex approach consistent with vLLM
             raw_tool_calls = self.tool_call_regex.findall(text)
-            if not raw_tool_calls:
-                # Fallback: maybe the whole text is inside the tag or tags are stripped
-                if self.tool_call_prefix in text:
-                    raw_tool_calls = [text]
+            if not raw_tool_calls and self.function_end_token in text:
+                # Внешний <tool_call> не закрыт, но тело функции завершено: аргументы
+                # целые, вызов извлекаем. Оборванное тело вызовом НЕ считаем -- иначе
+                # инструмент получит обрезанный аргумент вида {"city": "Par"}.
+                raw_tool_calls = [text]
 
             tool_idx = 0
             for tool_content in raw_tool_calls:
