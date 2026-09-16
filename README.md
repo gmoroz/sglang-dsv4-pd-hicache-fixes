@@ -22,9 +22,28 @@ configuration.
   host space can be reserved for transfers.
 - **Allocation diagnostics.** The diagnostic branch adds throttled
   `LOADBACK_GATE` and `LOADBACK_PATH` log points around host load-back decisions.
+- **Coordinated FULL/SWA host eviction.** Per-component eviction could drop the
+  SWA host copy of a radix node while keeping its FULL copy, leaving an entry
+  that no longer produced a useful host hit. Eviction now walks the SWA host LRU,
+  skips locked and stale nodes, and releases the paired FULL and SWA copies
+  together. A separate `hicache_swa_ratio` sizes the SWA host pool independently
+  of `hicache_ratio`, which still sizes the state pools.
+- **Tool calls with a completed body but no outer marker.** The DeepSeek and
+  Qwen3-Coder detectors accept a function body whose inner invoke marker is
+  closed even when the outer marker is absent; a truncated body without a
+  closing marker is still rejected. When a tool-call marker is present but the
+  detector returns neither a call nor normal text, the parser keeps the original
+  text instead of dropping the response silently.
+- **Degenerate repetition guard.** A request whose output collapses into a
+  repeating tail is finished deterministically: the scheduler checks the last
+  320 tokens for a period of 4 to 64 tokens repeated five times, at most once
+  per 32 accepted tokens. Covered by unit tests for the period bounds, the
+  repeat threshold, and non-repeating output.
 
 These changes address invisible per-pool saturation, failed host-space
-reservation, and scheduler crashes caused by unsupported state-sidecar metrics.
+reservation, scheduler crashes caused by unsupported state-sidecar metrics,
+host copies that survive their pair, dropped tool calls, and requests that
+never terminate on repeated output.
 
 ## Upstream context
 
