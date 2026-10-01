@@ -21,6 +21,7 @@ impl PolicyFactory {
             PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
             PolicyConfig::CacheAware {
                 cache_threshold,
+                enable_cost_aware_routing,
                 balance_abs_threshold,
                 balance_rel_threshold,
                 eviction_interval_secs,
@@ -28,6 +29,7 @@ impl PolicyFactory {
             } => {
                 let config = CacheAwareConfig {
                     cache_threshold: *cache_threshold,
+                    enable_cost_aware_routing: *enable_cost_aware_routing,
                     balance_abs_threshold: *balance_abs_threshold,
                     balance_rel_threshold: *balance_rel_threshold,
                     eviction_interval_secs: *eviction_interval_secs,
@@ -110,6 +112,7 @@ mod tests {
 
         let policy = PolicyFactory::create_from_config(&PolicyConfig::CacheAware {
             cache_threshold: 0.7,
+            enable_cost_aware_routing: false,
             balance_abs_threshold: 10,
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 30,

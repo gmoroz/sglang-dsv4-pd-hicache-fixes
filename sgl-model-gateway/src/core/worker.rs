@@ -1,7 +1,7 @@
 use std::{
     fmt,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering},
         Arc, LazyLock, RwLock as StdRwLock,
     },
     time::Duration,
@@ -209,6 +209,18 @@ pub trait Worker: Send + Sync + fmt::Debug {
 
     /// Reset the load counter to 0 (for sync/recovery)
     fn reset_load(&self) {}
+
+    /// Возвращает последний снимок непросчитанных токенов или `None`, если снимок неизвестен.
+    fn waiting_uncached_tokens(&self) -> Option<usize>;
+
+    /// Возвращает непросчитанные токены с учётом запросов после последнего снимка.
+    fn estimated_waiting_uncached_tokens(&self) -> Option<usize>;
+
+    /// Заменяет снимок непросчитанных токенов и сбрасывает локальную поправку.
+    fn set_waiting_uncached_tokens(&self, tokens: Option<usize>);
+
+    /// Учитывает непросчитанные токены запроса, отправленного после последнего снимка.
+    fn add_dispatched_uncached_tokens(&self, tokens: usize);
 
     /// Get the worker routing key load tracker
     fn worker_routing_key_load(&self) -> &WorkerRoutingKeyLoad;
@@ -650,6 +662,8 @@ impl WorkerMetadata {
 pub struct BasicWorker {
     pub metadata: WorkerMetadata,
     pub load_counter: Arc<AtomicUsize>,
+    pub waiting_uncached_tokens: Arc<AtomicIsize>,
+    pub dispatched_uncached_tokens: Arc<AtomicUsize>,
     pub worker_routing_key_load: Arc<WorkerRoutingKeyLoad>,
     pub processed_counter: Arc<AtomicUsize>,
     pub healthy: Arc<AtomicBool>,
@@ -809,6 +823,27 @@ impl Worker for BasicWorker {
     fn reset_load(&self) {
         self.load_counter.store(0, Ordering::Relaxed);
         self.update_running_requests_metrics();
+    }
+
+    fn waiting_uncached_tokens(&self) -> Option<usize> {
+        usize::try_from(self.waiting_uncached_tokens.load(Ordering::Acquire)).ok()
+    }
+
+    fn estimated_waiting_uncached_tokens(&self) -> Option<usize> {
+        self.waiting_uncached_tokens().map(|waiting| {
+            waiting.saturating_add(self.dispatched_uncached_tokens.load(Ordering::Acquire))
+        })
+    }
+
+    fn set_waiting_uncached_tokens(&self, tokens: Option<usize>) {
+        let waiting = tokens.and_then(|value| isize::try_from(value).ok()).unwrap_or(-1);
+        self.waiting_uncached_tokens.store(waiting, Ordering::Release);
+        self.dispatched_uncached_tokens.store(0, Ordering::Release);
+    }
+
+    fn add_dispatched_uncached_tokens(&self, tokens: usize) {
+        self.dispatched_uncached_tokens
+            .fetch_add(tokens, Ordering::AcqRel);
     }
 
     fn worker_routing_key_load(&self) -> &WorkerRoutingKeyLoad {
@@ -1065,6 +1100,22 @@ impl Worker for DPAwareWorker {
 
     fn reset_load(&self) {
         self.base_worker.reset_load();
+    }
+
+    fn waiting_uncached_tokens(&self) -> Option<usize> {
+        self.base_worker.waiting_uncached_tokens()
+    }
+
+    fn estimated_waiting_uncached_tokens(&self) -> Option<usize> {
+        self.base_worker.estimated_waiting_uncached_tokens()
+    }
+
+    fn set_waiting_uncached_tokens(&self, tokens: Option<usize>) {
+        self.base_worker.set_waiting_uncached_tokens(tokens);
+    }
+
+    fn add_dispatched_uncached_tokens(&self, tokens: usize) {
+        self.base_worker.add_dispatched_uncached_tokens(tokens);
     }
 
     fn worker_routing_key_load(&self) -> &WorkerRoutingKeyLoad {

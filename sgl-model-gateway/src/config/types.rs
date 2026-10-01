@@ -261,6 +261,8 @@ pub enum PolicyConfig {
     #[serde(rename = "cache_aware")]
     CacheAware {
         cache_threshold: f32,
+        #[serde(default)]
+        enable_cost_aware_routing: bool,
         balance_abs_threshold: usize,
         balance_rel_threshold: f32,
         eviction_interval_secs: u64,
@@ -808,6 +810,7 @@ mod tests {
 
         let cache_aware = PolicyConfig::CacheAware {
             cache_threshold: 0.8,
+            enable_cost_aware_routing: false,
             balance_abs_threshold: 10,
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 300,
@@ -829,6 +832,7 @@ mod tests {
 
         let cache_aware = PolicyConfig::CacheAware {
             cache_threshold: 0.8,
+            enable_cost_aware_routing: false,
             balance_abs_threshold: 10,
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 300,
@@ -851,6 +855,7 @@ mod tests {
     fn test_cache_aware_parameters() {
         let cache_aware = PolicyConfig::CacheAware {
             cache_threshold: 0.75,
+            enable_cost_aware_routing: false,
             balance_abs_threshold: 20,
             balance_rel_threshold: 2.0,
             eviction_interval_secs: 600,
@@ -860,6 +865,7 @@ mod tests {
         match cache_aware {
             PolicyConfig::CacheAware {
                 cache_threshold,
+                enable_cost_aware_routing: _,
                 balance_abs_threshold,
                 balance_rel_threshold,
                 eviction_interval_secs,
@@ -1253,6 +1259,7 @@ mod tests {
             decode_urls: vec!["http://decode1".to_string()],
             prefill_policy: Some(PolicyConfig::CacheAware {
                 cache_threshold: 0.5,
+                enable_cost_aware_routing: false,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
@@ -1283,6 +1290,7 @@ mod tests {
             decode_urls: vec!["http://decode1".to_string()],
             prefill_policy: Some(PolicyConfig::CacheAware {
                 cache_threshold: 0.5,
+                enable_cost_aware_routing: false,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
@@ -1339,6 +1347,7 @@ mod tests {
 
         let main_policy = PolicyConfig::CacheAware {
             cache_threshold: 0.7,
+            enable_cost_aware_routing: false,
             balance_abs_threshold: 20,
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 300,

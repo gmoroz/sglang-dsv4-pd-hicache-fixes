@@ -77,6 +77,11 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         // Default: no-op for policies that don't use load information
     }
 
+    /// Нужны ли политике периодические снимки нагрузки воркеров.
+    fn needs_worker_load_monitor(&self) -> bool {
+        false
+    }
+
     /// Set mesh sync manager
     fn set_mesh_sync(&mut self, _mesh_sync: OptionalMeshSyncManager) {
         // Default: no-op for policies that don't use mesh sync
@@ -97,6 +102,7 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
 #[derive(Debug, Clone)]
 pub struct CacheAwareConfig {
     pub cache_threshold: f32,
+    pub enable_cost_aware_routing: bool,
     pub balance_abs_threshold: usize,
     pub balance_rel_threshold: f32,
     pub eviction_interval_secs: u64,
@@ -107,6 +113,7 @@ impl Default for CacheAwareConfig {
     fn default() -> Self {
         Self {
             cache_threshold: 0.5,
+            enable_cost_aware_routing: false,
             balance_abs_threshold: 32,
             balance_rel_threshold: 1.1,
             eviction_interval_secs: 30,

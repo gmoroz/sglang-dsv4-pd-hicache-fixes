@@ -181,12 +181,13 @@ impl WorkerManager {
                     let load = if is_http {
                         Self::parse_load_response(&client, &url, api_key.as_deref()).await
                     } else {
-                        -1
+                        None
                     };
+                    worker.set_waiting_uncached_tokens(load);
                     WorkerLoadInfo {
                         worker: url,
                         worker_type,
-                        load,
+                        load: load.and_then(|value| isize::try_from(value).ok()).unwrap_or(-1),
                     }
                 }
             })
@@ -208,7 +209,7 @@ impl WorkerManager {
         client: &reqwest::Client,
         url: &str,
         api_key: Option<&str>,
-    ) -> isize {
+    ) -> Option<usize> {
         let load_url = format!("{}/v1/loads?include=core", url);
         let mut req = client.get(&load_url).timeout(REQUEST_TIMEOUT);
         if let Some(key) = api_key {
@@ -217,16 +218,24 @@ impl WorkerManager {
 
         match req.send().await {
             Ok(r) if r.status().is_success() => match r.json::<Value>().await {
-                Ok(json) => json
-                    .get("aggregate")
-                    .and_then(|a| a.get("total_tokens"))
-                    .and_then(|v| v.as_i64())
-                    .map(|n| n as isize)
-                    .unwrap_or(-1),
-                _ => -1,
+                Ok(json) => Self::parse_waiting_uncached_tokens(&json),
+                Err(_) => None,
             },
-            _ => -1,
+            _ => None,
         }
+    }
+
+    fn parse_waiting_uncached_tokens(json: &Value) -> Option<usize> {
+        let loads = json.get("loads")?.as_array()?;
+        if loads.is_empty() {
+            return None;
+        }
+
+        loads.iter().try_fold(0usize, |total, load| {
+            let waiting_tokens = load.get("num_waiting_uncached_tokens")?.as_u64()?;
+            let waiting_tokens = usize::try_from(waiting_tokens).ok()?;
+            total.checked_add(waiting_tokens)
+        })
     }
 
     pub async fn get_engine_metrics(
@@ -349,8 +358,8 @@ impl LoadMonitor {
 
             let power_of_two_policies = policy_registry.get_all_power_of_two_policies();
 
-            if power_of_two_policies.is_empty() {
-                debug!("No PowerOfTwo policies found, skipping load fetch");
+            if !policy_registry.needs_worker_load_monitor() {
+                debug!("No load-aware policies found, skipping load fetch");
                 continue;
             }
 
@@ -390,5 +399,65 @@ impl Drop for LoadMonitor {
                 handle.abort();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_waiting_uncached_tokens_dp_loads_returns_sum() {
+        // Подготовка
+        let response = serde_json::json!({
+            "timestamp": "2026-10-01T00:00:00+00:00",
+            "version": "0.5.16",
+            "accelerator": "cuda",
+            "num_accelerators": 8,
+            "loads": [
+                {
+                    "timestamp": 1.0,
+                    "dp_rank": 0,
+                    "num_running_reqs": 1,
+                    "num_waiting_reqs": 1,
+                    "num_waiting_uncached_tokens": 421000,
+                    "num_used_tokens": 2,
+                    "num_total_tokens": 3,
+                    "num_active_tokens": 3,
+                    "max_total_num_tokens": 4,
+                    "max_running_requests": 5,
+                    "token_usage": 0.5,
+                    "gen_throughput": 1.0,
+                    "cache_hit_rate": 0.5,
+                    "utilization": 0.5,
+                    "total_prefill_uncached_tokens": 6,
+                    "total_prefill_busy_us": 7
+                },
+                {
+                    "timestamp": 1.0,
+                    "dp_rank": 1,
+                    "num_running_reqs": 0,
+                    "num_waiting_reqs": 0,
+                    "num_waiting_uncached_tokens": 17,
+                    "num_used_tokens": 0,
+                    "num_total_tokens": 3,
+                    "num_active_tokens": 3,
+                    "max_total_num_tokens": 4,
+                    "max_running_requests": 5,
+                    "token_usage": 0.0,
+                    "gen_throughput": 1.0,
+                    "cache_hit_rate": 0.5,
+                    "utilization": 0.5,
+                    "total_prefill_uncached_tokens": 6,
+                    "total_prefill_busy_us": 7
+                }
+            ]
+        });
+
+        // Действие
+        let waiting_tokens = WorkerManager::parse_waiting_uncached_tokens(&response);
+
+        // Проверка
+        assert_eq!(waiting_tokens, Some(421_017));
     }
 }

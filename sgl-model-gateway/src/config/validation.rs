@@ -153,6 +153,7 @@ impl ConfigValidator {
             | PolicyConfig::ConsistentHashing => {}
             PolicyConfig::CacheAware {
                 cache_threshold,
+                enable_cost_aware_routing: _,
                 balance_abs_threshold: _,
                 balance_rel_threshold,
                 eviction_interval_secs,
@@ -725,6 +726,7 @@ mod tests {
             },
             PolicyConfig::CacheAware {
                 cache_threshold: 1.5, // Invalid: > 1.0
+                enable_cost_aware_routing: false,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
@@ -744,6 +746,7 @@ mod tests {
             },
             PolicyConfig::CacheAware {
                 cache_threshold: 0.5,
+                enable_cost_aware_routing: false,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
@@ -798,6 +801,7 @@ mod tests {
             },
             PolicyConfig::CacheAware {
                 cache_threshold: 0.5,
+                enable_cost_aware_routing: false,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
@@ -842,6 +846,7 @@ mod tests {
                 ],
                 prefill_policy: Some(PolicyConfig::CacheAware {
                     cache_threshold: 0.5,
+                    enable_cost_aware_routing: false,
                     balance_abs_threshold: 32,
                     balance_rel_threshold: 1.1,
                     eviction_interval_secs: 60,

@@ -294,6 +294,23 @@ impl PolicyRegistry {
         power_of_two_policies
     }
 
+    /// Проверяет, нужна ли хотя бы одной политике периодическая загрузка снимков воркеров.
+    pub fn needs_worker_load_monitor(&self) -> bool {
+        self.default_policy.needs_worker_load_monitor()
+            || self
+                .prefill_policy
+                .get()
+                .is_some_and(|policy| policy.needs_worker_load_monitor())
+            || self
+                .decode_policy
+                .get()
+                .is_some_and(|policy| policy.needs_worker_load_monitor())
+            || self
+                .model_policies
+                .iter()
+                .any(|entry| entry.value().needs_worker_load_monitor())
+    }
+
     /// Initialize cache-aware policy with workers if applicable
     /// This should be called after workers are registered for a model
     pub fn init_cache_aware_policy(&self, model_id: &str, workers: &[Arc<dyn Worker>]) {

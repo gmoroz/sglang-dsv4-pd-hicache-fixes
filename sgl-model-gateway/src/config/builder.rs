@@ -118,6 +118,7 @@ impl RouterConfigBuilder {
     ) -> Self {
         self.config.policy = PolicyConfig::CacheAware {
             cache_threshold,
+            enable_cost_aware_routing: false,
             balance_abs_threshold,
             balance_rel_threshold,
             eviction_interval_secs,

@@ -99,6 +99,36 @@ fn tree_key_for_worker(worker: &dyn Worker) -> String {
     )
 }
 
+/// Оценка токенов HTTP-запроса, когда роутер не передал готовую токенизацию.
+const CHARS_PER_TOKEN: usize = 4;
+
+fn estimated_tokens_from_chars(char_count: usize) -> usize {
+    char_count.div_ceil(CHARS_PER_TOKEN)
+}
+
+fn request_token_count(info: &SelectWorkerInfo<'_>, input_char_count: usize) -> usize {
+    info.tokens
+        .filter(|tokens| !tokens.is_empty())
+        .map_or_else(|| estimated_tokens_from_chars(input_char_count), |tokens| tokens.len())
+}
+
+fn cached_token_count(
+    info: &SelectWorkerInfo<'_>,
+    request_tokens: usize,
+    matched_char_count: usize,
+    input_char_count: usize,
+) -> usize {
+    if input_char_count == 0 {
+        return 0;
+    }
+
+    if info.tokens.is_some_and(|tokens| !tokens.is_empty()) {
+        request_tokens.saturating_mul(matched_char_count) / input_char_count
+    } else {
+        estimated_tokens_from_chars(matched_char_count)
+    }
+}
+
 /// Cache-aware routing policy
 ///
 /// Routes requests based on cache affinity when load is balanced,
@@ -306,6 +336,38 @@ impl CacheAwarePolicy {
         }
     }
 
+    fn select_worker_min_cost(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        healthy_indices: &[usize],
+        info: &SelectWorkerInfo<'_>,
+        result: &super::tree::PrefixMatchResult,
+    ) -> Option<(usize, usize)> {
+        let request_tokens = request_token_count(info, result.input_char_count);
+        let cached_tokens = cached_token_count(
+            info,
+            request_tokens,
+            result.matched_char_count,
+            result.input_char_count,
+        );
+
+        healthy_indices
+            .iter()
+            .filter_map(|&idx| {
+                let waiting_tokens = workers[idx].estimated_waiting_uncached_tokens()?;
+                let cache_tokens = if workers[idx].url() == result.tenant.as_ref() {
+                    cached_tokens
+                } else {
+                    0
+                };
+                let uncached_tokens = request_tokens.saturating_sub(cache_tokens);
+                let cost = waiting_tokens.saturating_add(uncached_tokens);
+                Some((idx, cost, cache_tokens, uncached_tokens))
+            })
+            .min_by_key(|(_, cost, cache_tokens, _)| (*cost, std::cmp::Reverse(*cache_tokens)))
+            .map(|(idx, _, _, uncached_tokens)| (idx, uncached_tokens))
+    }
+
     fn select_worker_min_load(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -400,8 +462,12 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         // Check if load is imbalanced
         let is_imbalanced = max_load.saturating_sub(min_load) > self.config.balance_abs_threshold
             && (max_load as f32) > (min_load as f32 * self.config.balance_rel_threshold);
+        let cost_data_available = self.config.enable_cost_aware_routing
+            && healthy_indices
+                .iter()
+                .all(|&idx| workers[idx].estimated_waiting_uncached_tokens().is_some());
 
-        if is_imbalanced {
+        if is_imbalanced && !cost_data_available {
             return self.select_worker_min_load(
                 workers,
                 &request_text,
@@ -430,7 +496,13 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             };
 
             // Select worker without String allocation
-            let selected_idx = if match_rate > self.config.cache_threshold {
+            let cost_selection = cost_data_available
+                .then(|| self.select_worker_min_cost(workers, &healthy_indices, info, &result))
+                .flatten();
+            let selected_idx = if let Some((idx, uncached_tokens)) = cost_selection {
+                workers[idx].add_dispatched_uncached_tokens(uncached_tokens);
+                Some(idx)
+            } else if match_rate > self.config.cache_threshold {
                 // Cache hit path: find worker by URL (compare &str directly, no allocation)
                 let tenant_url: &str = &result.tenant;
                 workers
@@ -518,6 +590,10 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
     fn name(&self) -> &'static str {
         "cache_aware"
+    }
+
+    fn needs_worker_load_monitor(&self) -> bool {
+        self.config.enable_cost_aware_routing
     }
 
     fn needs_request_text(&self) -> bool {
@@ -609,6 +685,7 @@ mod tests {
     async fn test_cache_aware_with_imbalanced_load() {
         let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
             cache_threshold: 0.5,
+            enable_cost_aware_routing: false,
             balance_abs_threshold: 5,
             balance_rel_threshold: 2.0,
             eviction_interval_secs: 0, // Disable eviction thread
@@ -1507,5 +1584,174 @@ mod tests {
             assert!(prefill_ca.trees.is_empty());
             assert!(decode_ca.trees.is_empty());
         }
+    }
+
+    fn cost_aware_policy() -> CacheAwarePolicy {
+        CacheAwarePolicy::with_config(CacheAwareConfig {
+            enable_cost_aware_routing: true,
+            eviction_interval_secs: 0,
+            ..Default::default()
+        })
+    }
+
+    fn cost_aware_workers() -> Vec<Arc<dyn Worker>> {
+        vec![
+            Arc::new(BasicWorkerBuilder::new("http://a:8000").build()),
+            Arc::new(BasicWorkerBuilder::new("http://b:8000").build()),
+        ]
+    }
+
+    fn cache_on_worker_a(policy: &CacheAwarePolicy, workers: &[Arc<dyn Worker>], text: &str) {
+        policy.init_workers(workers);
+        let tree_key = format!("regular::{}", UNKNOWN_MODEL_ID);
+        let tree = policy
+            .trees
+            .get(&tree_key)
+            .map(|entry| entry.value().clone())
+            .unwrap();
+        tree.insert(text, workers[0].url());
+    }
+
+    #[tokio::test]
+    async fn test_cost_aware_full_cache_without_waiting_selects_cached_worker() {
+        // Подготовка
+        let policy = cost_aware_policy();
+        let workers = cost_aware_workers();
+        let text = "cached prompt";
+        let tokens = vec![0; 72_000];
+        cache_on_worker_a(&policy, &workers, text);
+        workers[0].set_waiting_uncached_tokens(Some(0));
+        workers[1].set_waiting_uncached_tokens(Some(0));
+        let info = SelectWorkerInfo {
+            request_text: Some(text),
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+
+        // Действие
+        let selected = policy.select_worker(&workers, &info).await;
+
+        // Проверка
+        assert_eq!(selected, Some(0));
+    }
+
+    #[tokio::test]
+    async fn test_cost_aware_large_waiting_prefers_empty_worker() {
+        // Подготовка
+        let policy = cost_aware_policy();
+        let workers = cost_aware_workers();
+        let text = "cached prompt";
+        let tokens = vec![0; 72_000];
+        cache_on_worker_a(&policy, &workers, text);
+        workers[0].set_waiting_uncached_tokens(Some(421_000));
+        workers[1].set_waiting_uncached_tokens(Some(0));
+        let info = SelectWorkerInfo {
+            request_text: Some(text),
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+
+        // Действие
+        let selected = policy.select_worker(&workers, &info).await;
+
+        // Проверка
+        assert_eq!(selected, Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_cost_aware_cached_request_beats_shorter_queue() {
+        // Подготовка
+        let policy = cost_aware_policy();
+        let workers = cost_aware_workers();
+        let text = "cached prompt";
+        let tokens = vec![0; 400_000];
+        cache_on_worker_a(&policy, &workers, text);
+        workers[0].set_waiting_uncached_tokens(Some(50_000));
+        workers[1].set_waiting_uncached_tokens(Some(0));
+        let info = SelectWorkerInfo {
+            request_text: Some(text),
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+
+        // Действие
+        let selected = policy.select_worker(&workers, &info).await;
+
+        // Проверка
+        assert_eq!(selected, Some(0));
+    }
+
+    #[tokio::test]
+    async fn test_cost_aware_uncached_request_prefers_empty_worker() {
+        // Подготовка
+        let policy = cost_aware_policy();
+        let workers = cost_aware_workers();
+        policy.init_workers(&workers);
+        workers[0].set_waiting_uncached_tokens(Some(1));
+        workers[1].set_waiting_uncached_tokens(Some(0));
+        let tokens = vec![0; 10];
+        let info = SelectWorkerInfo {
+            request_text: Some("new prompt"),
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+
+        // Действие
+        let selected = policy.select_worker(&workers, &info).await;
+
+        // Проверка
+        assert_eq!(selected, Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_cost_aware_dispatched_prefill_tokens_affect_next_selection() {
+        // Подготовка
+        let policy = cost_aware_policy();
+        let workers = cost_aware_workers();
+        policy.init_workers(&workers);
+        workers[0].set_waiting_uncached_tokens(Some(0));
+        workers[1].set_waiting_uncached_tokens(Some(0));
+        let tokens = vec![0; 10];
+        let first = SelectWorkerInfo {
+            request_text: Some("first prompt"),
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        let second = SelectWorkerInfo {
+            request_text: Some("different prompt"),
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+
+        // Действие
+        let first_selected = policy.select_worker(&workers, &first).await;
+        let second_selected = policy.select_worker(&workers, &second).await;
+
+        // Проверка
+        assert_eq!(first_selected, Some(0));
+        assert_eq!(second_selected, Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_cost_aware_unknown_waiting_preserves_previous_selection() {
+        // Подготовка
+        let policy = cost_aware_policy();
+        let workers = cost_aware_workers();
+        let text = "cached prompt";
+        cache_on_worker_a(&policy, &workers, text);
+        for _ in 0..65 {
+            workers[0].increment_load();
+        }
+        let info = SelectWorkerInfo {
+            request_text: Some(text),
+            tokens: Some(&[0; 72_000]),
+            ..Default::default()
+        };
+
+        // Действие
+        let selected = policy.select_worker(&workers, &info).await;
+
+        // Проверка
+        assert_eq!(selected, Some(1));
     }
 }

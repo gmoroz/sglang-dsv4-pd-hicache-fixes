@@ -57,6 +57,7 @@ class RouterArgs:
     worker_startup_timeout_secs: int = 1800
     worker_startup_check_interval: int = 30
     cache_threshold: float = 0.3
+    enable_cost_aware_routing: bool = False
     balance_abs_threshold: int = 64
     balance_rel_threshold: float = 1.5
     eviction_interval_secs: int = 60
@@ -306,6 +307,12 @@ class RouterArgs:
             type=float,
             default=RouterArgs.cache_threshold,
             help="Cache threshold (0.0-1.0) for cache-aware routing",
+        )
+        routing_group.add_argument(
+            f"--{prefix}enable-cost-aware-routing",
+            action="store_true",
+            default=RouterArgs.enable_cost_aware_routing,
+            help="Enable token-cost routing for cache-aware policy",
         )
         routing_group.add_argument(
             f"--{prefix}balance-abs-threshold",

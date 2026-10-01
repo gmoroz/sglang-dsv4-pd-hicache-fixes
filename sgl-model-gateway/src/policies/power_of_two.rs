@@ -116,6 +116,10 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
         }
     }
 
+    fn needs_worker_load_monitor(&self) -> bool {
+        true
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

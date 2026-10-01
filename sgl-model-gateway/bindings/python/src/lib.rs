@@ -358,6 +358,7 @@ struct Router {
     worker_startup_timeout_secs: u64,
     worker_startup_check_interval: u64,
     cache_threshold: f32,
+    enable_cost_aware_routing: bool,
     balance_abs_threshold: usize,
     balance_rel_threshold: f32,
     eviction_interval_secs: u64,
@@ -473,6 +474,7 @@ impl Router {
                 PolicyType::RoundRobin => ConfigPolicyConfig::RoundRobin,
                 PolicyType::CacheAware => ConfigPolicyConfig::CacheAware {
                     cache_threshold: self.cache_threshold,
+                    enable_cost_aware_routing: self.enable_cost_aware_routing,
                     balance_abs_threshold: self.balance_abs_threshold,
                     balance_rel_threshold: self.balance_rel_threshold,
                     eviction_interval_secs: self.eviction_interval_secs,
@@ -761,6 +763,7 @@ impl Router {
         pool_max_idle_per_host = 500,
         tcp_keepalive_secs = 30,
         enable_wasm = false,
+        enable_cost_aware_routing = false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -853,6 +856,7 @@ impl Router {
         pool_max_idle_per_host: usize,
         tcp_keepalive_secs: u64,
         enable_wasm: bool,
+        enable_cost_aware_routing: bool,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -876,6 +880,7 @@ impl Router {
             worker_startup_timeout_secs,
             worker_startup_check_interval,
             cache_threshold,
+            enable_cost_aware_routing,
             balance_abs_threshold,
             balance_rel_threshold,
             eviction_interval_secs,
