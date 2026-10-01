@@ -101,9 +101,10 @@ fn tree_key_for_worker(worker: &dyn Worker) -> String {
 
 /// Оценка ASCII-символов на токен (латиница/код).
 const ASCII_CHARS_PER_TOKEN: usize = 4;
-/// Для не-ASCII (кириллица ~1.5 символа/токен) считаем `ceil(n * 2 / 3)`.
-const NON_ASCII_CHARS_NUM: usize = 2;
-const NON_ASCII_CHARS_DEN: usize = 3;
+/// Для не-ASCII: замер на токенизаторе DeepSeek-V4.1 дал ~2.4 символа/токен
+/// для русского текста, поэтому `ceil(n * 5 / 12)`.
+const NON_ASCII_CHARS_NUM: usize = 5;
+const NON_ASCII_CHARS_DEN: usize = 12;
 /// Порог логирования cost-решения.
 const COST_LOG_MIN_REQUEST_TOKENS: usize = 32_000;
 
@@ -1852,24 +1853,51 @@ mod tests {
 
     #[test]
     fn test_estimated_tokens_from_text_cyrillic_and_ascii_code() {
-        // Подготовка: кириллица ~1.5 символа/токен; ASCII-код ~4 символа/токен.
-        let cyrillic = "привет мир ".repeat(1000);
-        let code = "def foo(x):\n    return x + 1\n".repeat(200);
+        // Эталоны — DeepSeek-V4.1-Flash tokenizer.json, add_special_tokens=false.
+        const CYRILLIC_REF_TOKENS: usize = 153;
+        const CODE_REF_TOKENS: usize = 173;
+        const MAX_REL_ERR: f64 = 0.25;
 
-        // Действие
-        let cyr_est = estimated_tokens_from_text(&cyrillic);
-        let code_est = estimated_tokens_from_text(&code);
+        let cyrillic = concat!(
+            "## Факты о процессе\n",
+            "- «Нельзя параллельно», «делят квоту», «не больше N» — утверждения о фактах: нужен замер или документ, иначе это гипотеза.\n",
+            "- Причину отказа LLM называть по коду: 401 — авторизация, 429 — квота, таймаут без 429 — латентность. Совпадение по времени с другой нагрузкой — не причина.\n",
+            "- Квоты `intapi` (`/internal/llm/v1`) раздельные, свой токен на модель. Лимиты — `advanced-account-agent/docs/analytics/MODELS_AND_QUOTAS.md`.",
+        );
+        let code = concat!(
+            "fn estimated_tokens_from_text(text: &str) -> usize {\n",
+            "    let mut ascii_chars = 0usize;\n",
+            "    let mut non_ascii_chars = 0usize;\n",
+            "    for ch in text.chars() {\n",
+            "        if ch.is_ascii() {\n",
+            "            ascii_chars += 1;\n",
+            "        } else {\n",
+            "            non_ascii_chars += 1;\n",
+            "        }\n",
+            "    }\n",
+            "    let ascii_tokens = ascii_chars.div_ceil(ASCII_CHARS_PER_TOKEN);\n",
+            "    let non_ascii_tokens = non_ascii_chars\n",
+            "        .saturating_mul(NON_ASCII_CHARS_NUM)\n",
+            "        .div_ceil(NON_ASCII_CHARS_DEN);\n",
+            "    ascii_tokens.saturating_add(non_ascii_tokens)\n",
+            "}",
+        );
 
-        // Проверка: ошибка к ожидаемым порядкам <= 25%.
-        let cyr_chars = cyrillic.chars().count();
-        let cyr_expected = (cyr_chars * 2).div_ceil(3); // ~1.5 chars/token
-        let cyr_err = (cyr_est as i64 - cyr_expected as i64).unsigned_abs() as f64
-            / cyr_expected as f64;
-        assert!(cyr_err <= 0.25, "cyrillic err={cyr_err} est={cyr_est} exp={cyr_expected}");
+        let cyr_est = estimated_tokens_from_text(cyrillic);
+        let code_est = estimated_tokens_from_text(code);
 
-        let code_expected = code.chars().count().div_ceil(4);
-        let code_err = (code_est as i64 - code_expected as i64).unsigned_abs() as f64
-            / code_expected as f64;
-        assert!(code_err <= 0.25, "code err={code_err} est={code_est} exp={code_expected}");
+        let cyr_err = (cyr_est as i64 - CYRILLIC_REF_TOKENS as i64).unsigned_abs() as f64
+            / CYRILLIC_REF_TOKENS as f64;
+        assert!(
+            cyr_err <= MAX_REL_ERR,
+            "cyrillic err={cyr_err} est={cyr_est} ref={CYRILLIC_REF_TOKENS}"
+        );
+
+        let code_err = (code_est as i64 - CODE_REF_TOKENS as i64).unsigned_abs() as f64
+            / CODE_REF_TOKENS as f64;
+        assert!(
+            code_err <= MAX_REL_ERR,
+            "code err={code_err} est={code_est} ref={CODE_REF_TOKENS}"
+        );
     }
 }
