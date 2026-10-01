@@ -127,7 +127,7 @@ impl BasicWorkerBuilder {
     /// Build the BasicWorker instance
     pub fn build(self) -> BasicWorker {
         use std::sync::{
-            atomic::{AtomicBool, AtomicIsize, AtomicUsize},
+            atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicUsize},
             Arc, RwLock as StdRwLock,
         };
 
@@ -173,7 +173,10 @@ impl BasicWorkerBuilder {
             metadata,
             load_counter: Arc::new(AtomicUsize::new(0)),
             waiting_uncached_tokens: Arc::new(AtomicIsize::new(-1)),
+            waiting_uncached_updated_at_ms: Arc::new(AtomicU64::new(0)),
             dispatched_uncached_tokens: Arc::new(AtomicUsize::new(0)),
+            load_poll_failing: Arc::new(AtomicBool::new(false)),
+            load_poll_fail_log_ms: Arc::new(AtomicU64::new(0)),
             worker_routing_key_load: Arc::new(WorkerRoutingKeyLoad::new(&self.url)),
             processed_counter: Arc::new(AtomicUsize::new(0)),
             healthy: Arc::new(AtomicBool::new(healthy)),

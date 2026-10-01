@@ -1,4 +1,10 @@
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Instant,
+};
 
 use axum::{
     body::{to_bytes, Body},
@@ -130,13 +136,14 @@ impl Router {
         }
     }
 
-    /// Select worker for a specific model considering circuit breaker state
+    /// Select worker for a specific model considering circuit breaker state.
+    /// Второй элемент — uncached-токены, учтённые cost-aware на выбранном воркере.
     async fn select_worker_for_model(
         &self,
         model_id: Option<&str>,
         text: Option<&str>,
         headers: Option<&HeaderMap>,
-    ) -> Option<Arc<dyn Worker>> {
+    ) -> Option<(Arc<dyn Worker>, usize)> {
         let effective_model_id = if !self.enable_igw { None } else { model_id };
 
         // Get workers for the specified model O(1), filtered by connection mode
@@ -168,6 +175,7 @@ impl Router {
             .worker_registry
             .get_hash_ring(effective_model_id.unwrap_or(UNKNOWN_MODEL_ID));
 
+        let cost_uncached = AtomicUsize::new(0);
         let idx = policy
             .select_worker(
                 &available,
@@ -176,6 +184,7 @@ impl Router {
                     tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
                     headers,
                     hash_ring,
+                    cost_uncached_tokens: Some(&cost_uncached),
                 },
             )
             .await?;
@@ -188,7 +197,10 @@ impl Router {
             policy.name(),
         );
 
-        Some(available[idx].clone())
+        Some((
+            available[idx].clone(),
+            cost_uncached.load(Ordering::Relaxed),
+        ))
     }
 
     pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
@@ -279,11 +291,11 @@ impl Router {
         is_stream: bool,
         text: &str,
     ) -> Response {
-        let worker = match self
+        let (worker, pending_uncached) = match self
             .select_worker_for_model(model_id, Some(text), headers)
             .await
         {
-            Some(w) => w,
+            Some(pair) => pair,
             None => {
                 return error::service_unavailable(
                     "no_available_workers",
@@ -299,7 +311,9 @@ impl Router {
 
         let load_guard = ["cache_aware", "manual"]
             .contains(&policy.name())
-            .then(|| WorkerLoadGuard::new(worker.clone(), headers));
+            .then(|| {
+                WorkerLoadGuard::with_pending_uncached(worker.clone(), headers, pending_uncached)
+            });
 
         // Note: Using borrowed reference avoids heap allocation
         events::RequestSentEvent { url: worker.url() }.emit();

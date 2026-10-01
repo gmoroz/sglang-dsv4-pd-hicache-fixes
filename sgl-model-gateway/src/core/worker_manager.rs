@@ -179,11 +179,26 @@ impl WorkerManager {
 
                 async move {
                     let load = if is_http {
-                        Self::parse_load_response(&client, &url, api_key.as_deref()).await
+                        match Self::fetch_waiting_uncached_tokens(
+                            &client,
+                            &url,
+                            api_key.as_deref(),
+                        )
+                        .await
+                        {
+                            Ok(tokens) => {
+                                worker.set_waiting_uncached_tokens(Some(tokens));
+                                worker.note_load_poll_success();
+                                Some(tokens)
+                            }
+                            Err(reason) => {
+                                worker.note_load_poll_failure(&url, &reason);
+                                worker.waiting_uncached_tokens()
+                            }
+                        }
                     } else {
                         None
                     };
-                    worker.set_waiting_uncached_tokens(load);
                     WorkerLoadInfo {
                         worker: url,
                         worker_type,
@@ -205,24 +220,30 @@ impl WorkerManager {
         }
     }
 
-    async fn parse_load_response(
+    async fn fetch_waiting_uncached_tokens(
         client: &reqwest::Client,
         url: &str,
         api_key: Option<&str>,
-    ) -> Option<usize> {
+    ) -> Result<usize, String> {
         let load_url = format!("{}/v1/loads?include=core", url);
         let mut req = client.get(&load_url).timeout(REQUEST_TIMEOUT);
         if let Some(key) = api_key {
             req = req.bearer_auth(key);
         }
 
-        match req.send().await {
-            Ok(r) if r.status().is_success() => match r.json::<Value>().await {
-                Ok(json) => Self::parse_waiting_uncached_tokens(&json),
-                Err(_) => None,
-            },
-            _ => None,
+        let response = req
+            .send()
+            .await
+            .map_err(|err| format!("request error: {err}"))?;
+        if !response.status().is_success() {
+            return Err(format!("http status {}", response.status()));
         }
+        let json = response
+            .json::<Value>()
+            .await
+            .map_err(|err| format!("json error: {err}"))?;
+        Self::parse_waiting_uncached_tokens(&json)
+            .ok_or_else(|| "missing num_waiting_uncached_tokens".to_string())
     }
 
     fn parse_waiting_uncached_tokens(json: &Value) -> Option<usize> {
@@ -459,5 +480,22 @@ mod tests {
 
         // Проверка
         assert_eq!(waiting_tokens, Some(421_017));
+    }
+
+    #[test]
+    fn test_failed_poll_keeps_last_known_waiting_tokens() {
+        use crate::core::BasicWorkerBuilder;
+
+        // Подготовка
+        let worker = BasicWorkerBuilder::new("http://worker-a:8000").build();
+        worker.set_waiting_uncached_tokens(Some(421_000));
+        assert_eq!(worker.estimated_waiting_uncached_tokens(), Some(421_000));
+
+        // Действие: неуспешный опрос не вызывает set(None)
+        worker.note_load_poll_failure("http://worker-a:8000/v1/loads?include=core", "timeout");
+
+        // Проверка
+        assert_eq!(worker.waiting_uncached_tokens(), Some(421_000));
+        assert_eq!(worker.estimated_waiting_uncached_tokens(), Some(421_000));
     }
 }

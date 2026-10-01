@@ -1,10 +1,10 @@
 use std::{
     fmt,
     sync::{
-        atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicUsize, Ordering},
         Arc, LazyLock, RwLock as StdRwLock,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -31,6 +31,19 @@ pub const DEFAULT_WORKER_COST: f32 = 1.0;
 
 /// Default HTTP client timeout for worker requests (in seconds)
 pub const DEFAULT_WORKER_HTTP_TIMEOUT_SECS: u64 = 30;
+
+/// Максимальный возраст снимка `/v1/loads`, после которого нагрузка считается unknown.
+pub const LOAD_SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(30);
+
+/// Не чаще какого интервала логировать повторный неуспешный опрос нагрузки воркера.
+pub const LOAD_POLL_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+#[inline]
+fn monotonic_now_ms() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let start = START.get_or_init(Instant::now);
+    start.elapsed().as_millis() as u64
+}
 
 static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
@@ -213,14 +226,28 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Возвращает последний снимок непросчитанных токенов или `None`, если снимок неизвестен.
     fn waiting_uncached_tokens(&self) -> Option<usize>;
 
-    /// Возвращает непросчитанные токены с учётом запросов после последнего снимка.
+    /// Возвращает непросчитанные токены: `max(снимок движка, собственный учёт роутера)`.
+    ///
+    /// `None`, если снимка нет или он старше [`LOAD_SNAPSHOT_MAX_AGE`].
     fn estimated_waiting_uncached_tokens(&self) -> Option<usize>;
 
-    /// Заменяет снимок непросчитанных токенов и сбрасывает локальную поправку.
+    /// Заменяет снимок непросчитанных токенов. Собственный учёт роутера не сбрасывается.
     fn set_waiting_uncached_tokens(&self, tokens: Option<usize>);
 
-    /// Учитывает непросчитанные токены запроса, отправленного после последнего снимка.
+    /// Учитывает непросчитанные токены запроса до первого байта тела ответа / завершения.
     fn add_dispatched_uncached_tokens(&self, tokens: usize);
+
+    /// Текущий собственный учёт роутера (сумма ещё не «видимых» запросов).
+    fn dispatched_uncached_tokens(&self) -> usize;
+
+    /// Снимает учёт непросчитанных токенов после первого байта / завершения / ошибки.
+    fn remove_dispatched_uncached_tokens(&self, tokens: usize);
+
+    /// Логирует неуспешный опрос нагрузки без сброса последнего снимка.
+    fn note_load_poll_failure(&self, url: &str, reason: &str);
+
+    /// Сбрасывает состояние «опрос падает» после успешного снимка.
+    fn note_load_poll_success(&self);
 
     /// Get the worker routing key load tracker
     fn worker_routing_key_load(&self) -> &WorkerRoutingKeyLoad;
@@ -663,7 +690,10 @@ pub struct BasicWorker {
     pub metadata: WorkerMetadata,
     pub load_counter: Arc<AtomicUsize>,
     pub waiting_uncached_tokens: Arc<AtomicIsize>,
+    pub waiting_uncached_updated_at_ms: Arc<AtomicU64>,
     pub dispatched_uncached_tokens: Arc<AtomicUsize>,
+    pub load_poll_failing: Arc<AtomicBool>,
+    pub load_poll_fail_log_ms: Arc<AtomicU64>,
     pub worker_routing_key_load: Arc<WorkerRoutingKeyLoad>,
     pub processed_counter: Arc<AtomicUsize>,
     pub healthy: Arc<AtomicBool>,
@@ -830,20 +860,77 @@ impl Worker for BasicWorker {
     }
 
     fn estimated_waiting_uncached_tokens(&self) -> Option<usize> {
-        self.waiting_uncached_tokens().map(|waiting| {
-            waiting.saturating_add(self.dispatched_uncached_tokens.load(Ordering::Acquire))
-        })
+        let waiting = self.waiting_uncached_tokens()?;
+        let updated_at_ms = self.waiting_uncached_updated_at_ms.load(Ordering::Acquire);
+        if updated_at_ms == 0 {
+            return None;
+        }
+        let age_ms = monotonic_now_ms().saturating_sub(updated_at_ms);
+        if age_ms > LOAD_SNAPSHOT_MAX_AGE.as_millis() as u64 {
+            return None;
+        }
+        let pending = self.dispatched_uncached_tokens.load(Ordering::Acquire);
+        Some(waiting.max(pending))
     }
 
     fn set_waiting_uncached_tokens(&self, tokens: Option<usize>) {
-        let waiting = tokens.and_then(|value| isize::try_from(value).ok()).unwrap_or(-1);
-        self.waiting_uncached_tokens.store(waiting, Ordering::Release);
-        self.dispatched_uncached_tokens.store(0, Ordering::Release);
+        match tokens {
+            Some(value) => {
+                let waiting = isize::try_from(value).unwrap_or(isize::MAX);
+                self.waiting_uncached_tokens.store(waiting, Ordering::Release);
+                // 0 зарезервирован под «снимка не было»; первая мс процесса тоже даёт 0.
+                self.waiting_uncached_updated_at_ms
+                    .store(monotonic_now_ms().max(1), Ordering::Release);
+            }
+            None => {
+                self.waiting_uncached_tokens.store(-1, Ordering::Release);
+                self.waiting_uncached_updated_at_ms.store(0, Ordering::Release);
+            }
+        }
     }
 
     fn add_dispatched_uncached_tokens(&self, tokens: usize) {
+        if tokens == 0 {
+            return;
+        }
         self.dispatched_uncached_tokens
             .fetch_add(tokens, Ordering::AcqRel);
+    }
+
+    fn dispatched_uncached_tokens(&self) -> usize {
+        self.dispatched_uncached_tokens.load(Ordering::Acquire)
+    }
+
+    fn remove_dispatched_uncached_tokens(&self, tokens: usize) {
+        if tokens == 0 {
+            return;
+        }
+        let _ = self
+            .dispatched_uncached_tokens
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.saturating_sub(tokens))
+            });
+    }
+
+    fn note_load_poll_failure(&self, url: &str, reason: &str) {
+        let now = monotonic_now_ms();
+        let was_failing = self.load_poll_failing.swap(true, Ordering::AcqRel);
+        let last_log = self.load_poll_fail_log_ms.load(Ordering::Acquire);
+        let due = now.saturating_sub(last_log) >= LOAD_POLL_ERROR_LOG_INTERVAL.as_millis() as u64;
+        if !was_failing || due {
+            self.load_poll_fail_log_ms.store(now, Ordering::Release);
+            tracing::warn!(
+                url = %url,
+                reason = %reason,
+                "worker load poll failed; keeping last known snapshot"
+            );
+        }
+    }
+
+    fn note_load_poll_success(&self) {
+        if self.load_poll_failing.swap(false, Ordering::AcqRel) {
+            tracing::info!(url = %self.url(), "worker load poll recovered");
+        }
     }
 
     fn worker_routing_key_load(&self) -> &WorkerRoutingKeyLoad {
@@ -1118,6 +1205,22 @@ impl Worker for DPAwareWorker {
         self.base_worker.add_dispatched_uncached_tokens(tokens);
     }
 
+    fn dispatched_uncached_tokens(&self) -> usize {
+        self.base_worker.dispatched_uncached_tokens()
+    }
+
+    fn remove_dispatched_uncached_tokens(&self, tokens: usize) {
+        self.base_worker.remove_dispatched_uncached_tokens(tokens);
+    }
+
+    fn note_load_poll_failure(&self, url: &str, reason: &str) {
+        self.base_worker.note_load_poll_failure(url, reason);
+    }
+
+    fn note_load_poll_success(&self) {
+        self.base_worker.note_load_poll_success();
+    }
+
     fn worker_routing_key_load(&self) -> &WorkerRoutingKeyLoad {
         self.base_worker.worker_routing_key_load()
     }
@@ -1198,10 +1301,20 @@ impl Worker for DPAwareWorker {
 pub struct WorkerLoadGuard {
     worker: Arc<dyn Worker>,
     routing_key: Option<String>,
+    pending_uncached_tokens: usize,
+    pending_cleared: AtomicBool,
 }
 
 impl WorkerLoadGuard {
     pub fn new(worker: Arc<dyn Worker>, headers: Option<&http::HeaderMap>) -> Self {
+        Self::with_pending_uncached(worker, headers, 0)
+    }
+
+    pub fn with_pending_uncached(
+        worker: Arc<dyn Worker>,
+        headers: Option<&http::HeaderMap>,
+        pending_uncached_tokens: usize,
+    ) -> Self {
         use crate::routers::header_utils::extract_routing_key;
 
         worker.increment_load();
@@ -1215,15 +1328,45 @@ impl WorkerLoadGuard {
         Self {
             worker,
             routing_key,
+            pending_uncached_tokens,
+            pending_cleared: AtomicBool::new(pending_uncached_tokens == 0),
         }
+    }
+
+    fn clear_pending_uncached(&self) {
+        if self.pending_cleared.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.worker
+            .remove_dispatched_uncached_tokens(self.pending_uncached_tokens);
     }
 }
 
 impl Drop for WorkerLoadGuard {
     fn drop(&mut self) {
+        self.clear_pending_uncached();
         self.worker.decrement_load();
         if let Some(ref key) = self.routing_key {
             self.worker.worker_routing_key_load().decrement(key);
+        }
+    }
+}
+
+/// Уведомление о первом байте тела ответа (не заголовков).
+pub trait FirstByteNotify: Send {
+    fn on_first_body_byte(&self) {}
+}
+
+impl FirstByteNotify for WorkerLoadGuard {
+    fn on_first_body_byte(&self) {
+        self.clear_pending_uncached();
+    }
+}
+
+impl FirstByteNotify for Vec<WorkerLoadGuard> {
+    fn on_first_body_byte(&self) {
+        for guard in self {
+            guard.on_first_body_byte();
         }
     }
 }
@@ -1235,19 +1378,21 @@ impl Drop for WorkerLoadGuard {
 /// like WorkerLoadGuard that need to be tied to a response body's lifetime.
 pub struct AttachedBody<T> {
     inner: Body,
-    _attached: T,
+    attached: T,
+    first_byte_seen: bool,
 }
 
 impl<T> AttachedBody<T> {
     pub fn new(inner: Body, attached: T) -> Self {
         Self {
             inner,
-            _attached: attached,
+            attached,
+            first_byte_seen: false,
         }
     }
 }
 
-impl<T: Send + Unpin + 'static> AttachedBody<T> {
+impl<T: FirstByteNotify + Send + Unpin + 'static> AttachedBody<T> {
     pub fn wrap_response(
         response: axum::response::Response,
         attached: T,
@@ -1257,7 +1402,7 @@ impl<T: Send + Unpin + 'static> AttachedBody<T> {
     }
 }
 
-impl<T: Send + Unpin + 'static> http_body::Body for AttachedBody<T> {
+impl<T: FirstByteNotify + Send + Unpin + 'static> http_body::Body for AttachedBody<T> {
     type Data = bytes::Bytes;
     type Error = axum::Error;
 
@@ -1266,7 +1411,16 @@ impl<T: Send + Unpin + 'static> http_body::Body for AttachedBody<T> {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
         let this = self.get_mut();
-        std::pin::Pin::new(&mut this.inner).poll_frame(cx)
+        let poll = std::pin::Pin::new(&mut this.inner).poll_frame(cx);
+        if !this.first_byte_seen {
+            if let std::task::Poll::Ready(Some(Ok(ref frame))) = poll {
+                if frame.data_ref().is_some() {
+                    this.first_byte_seen = true;
+                    this.attached.on_first_body_byte();
+                }
+            }
+        }
+        poll
     }
 
     fn is_end_stream(&self) -> bool {
@@ -2271,5 +2425,47 @@ mod tests {
         drop(guard2);
         assert_eq!(worker.load(), 0);
         assert_eq!(worker.worker_routing_key_load().value(), 0);
+    }
+
+    #[test]
+    fn test_first_byte_clears_dispatched_uncached_tokens() {
+        use crate::core::{BasicWorkerBuilder, FirstByteNotify};
+
+        // Подготовка
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://test:8000")
+                .worker_type(WorkerType::Regular)
+                .build(),
+        );
+        worker.set_waiting_uncached_tokens(Some(0));
+        worker.add_dispatched_uncached_tokens(400_000);
+        assert_eq!(worker.estimated_waiting_uncached_tokens(), Some(400_000));
+        let guard = WorkerLoadGuard::with_pending_uncached(worker.clone(), None, 400_000);
+
+        // Действие
+        guard.on_first_body_byte();
+
+        // Проверка
+        assert_eq!(worker.dispatched_uncached_tokens(), 0);
+        assert_eq!(worker.estimated_waiting_uncached_tokens(), Some(0));
+        drop(guard);
+        assert_eq!(worker.dispatched_uncached_tokens(), 0);
+    }
+
+    #[test]
+    fn test_set_waiting_snapshot_does_not_reset_dispatched() {
+        use crate::core::BasicWorkerBuilder;
+
+        // Подготовка
+        let worker = BasicWorkerBuilder::new("http://test:8000").build();
+        worker.set_waiting_uncached_tokens(Some(0));
+        worker.add_dispatched_uncached_tokens(72_000);
+
+        // Действие
+        worker.set_waiting_uncached_tokens(Some(0));
+
+        // Проверка
+        assert_eq!(worker.dispatched_uncached_tokens(), 72_000);
+        assert_eq!(worker.estimated_waiting_uncached_tokens(), Some(72_000));
     }
 }

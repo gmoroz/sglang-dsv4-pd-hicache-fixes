@@ -13,7 +13,7 @@ use super::{
     proto_wrapper::{ProtoEmbedComplete, ProtoRequest, ProtoStream},
 };
 use crate::{
-    core::{Worker, WorkerLoadGuard},
+    core::{FirstByteNotify, Worker, WorkerLoadGuard},
     protocols::{
         chat::{ChatCompletionRequest, ChatCompletionResponse},
         classify::{ClassifyRequest, ClassifyResponse},
@@ -177,6 +177,18 @@ impl LoadGuards {
                 _prefill: WorkerLoadGuard::new(prefill.clone(), headers),
                 _decode: WorkerLoadGuard::new(decode.clone(), headers),
             },
+        }
+    }
+}
+
+impl FirstByteNotify for LoadGuards {
+    fn on_first_body_byte(&self) {
+        match self {
+            Self::Single { _guard } => _guard.on_first_body_byte(),
+            Self::Dual { _prefill, _decode } => {
+                _prefill.on_first_body_byte();
+                _decode.on_first_body_byte();
+            }
         }
     }
 }

@@ -65,7 +65,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use rand::Rng;
 use smg_mesh::{tree_ops::TreeOperation, OptionalMeshSyncManager};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::{
     get_healthy_worker_indices, normalize_model_key, tree::Tree, utils::PeriodicTask,
@@ -99,21 +99,47 @@ fn tree_key_for_worker(worker: &dyn Worker) -> String {
     )
 }
 
-/// Оценка токенов HTTP-запроса, когда роутер не передал готовую токенизацию.
-const CHARS_PER_TOKEN: usize = 4;
+/// Оценка ASCII-символов на токен (латиница/код).
+const ASCII_CHARS_PER_TOKEN: usize = 4;
+/// Для не-ASCII (кириллица ~1.5 символа/токен) считаем `ceil(n * 2 / 3)`.
+const NON_ASCII_CHARS_NUM: usize = 2;
+const NON_ASCII_CHARS_DEN: usize = 3;
+/// Порог логирования cost-решения.
+const COST_LOG_MIN_REQUEST_TOKENS: usize = 32_000;
+
+fn estimated_tokens_from_text(text: &str) -> usize {
+    let mut ascii_chars = 0usize;
+    let mut non_ascii_chars = 0usize;
+    for ch in text.chars() {
+        if ch.is_ascii() {
+            ascii_chars += 1;
+        } else {
+            non_ascii_chars += 1;
+        }
+    }
+    let ascii_tokens = ascii_chars.div_ceil(ASCII_CHARS_PER_TOKEN);
+    let non_ascii_tokens = non_ascii_chars
+        .saturating_mul(NON_ASCII_CHARS_NUM)
+        .div_ceil(NON_ASCII_CHARS_DEN);
+    ascii_tokens.saturating_add(non_ascii_tokens)
+}
 
 fn estimated_tokens_from_chars(char_count: usize) -> usize {
-    char_count.div_ceil(CHARS_PER_TOKEN)
+    // Fallback без текста: консервативно как ASCII.
+    char_count.div_ceil(ASCII_CHARS_PER_TOKEN)
 }
 
 fn request_token_count(info: &SelectWorkerInfo<'_>, input_char_count: usize) -> usize {
-    info.tokens
-        .filter(|tokens| !tokens.is_empty())
-        .map_or_else(|| estimated_tokens_from_chars(input_char_count), |tokens| tokens.len())
+    if let Some(tokens) = info.tokens.filter(|tokens| !tokens.is_empty()) {
+        return tokens.len();
+    }
+    if let Some(text) = info.request_text {
+        return estimated_tokens_from_text(text);
+    }
+    estimated_tokens_from_chars(input_char_count)
 }
 
 fn cached_token_count(
-    info: &SelectWorkerInfo<'_>,
     request_tokens: usize,
     matched_char_count: usize,
     input_char_count: usize,
@@ -122,11 +148,8 @@ fn cached_token_count(
         return 0;
     }
 
-    if info.tokens.is_some_and(|tokens| !tokens.is_empty()) {
-        request_tokens.saturating_mul(matched_char_count) / input_char_count
-    } else {
-        estimated_tokens_from_chars(matched_char_count)
-    }
+    // Доля совпавшего префикса в символах переносится на оценку токенов запроса.
+    request_tokens.saturating_mul(matched_char_count) / input_char_count
 }
 
 /// Cache-aware routing policy
@@ -345,27 +368,62 @@ impl CacheAwarePolicy {
     ) -> Option<(usize, usize)> {
         let request_tokens = request_token_count(info, result.input_char_count);
         let cached_tokens = cached_token_count(
-            info,
             request_tokens,
             result.matched_char_count,
             result.input_char_count,
         );
 
-        healthy_indices
+        let mut per_worker = Vec::with_capacity(healthy_indices.len());
+        for &idx in healthy_indices {
+            let Some(waiting_tokens) = workers[idx].estimated_waiting_uncached_tokens() else {
+                continue;
+            };
+            let snapshot = workers[idx].waiting_uncached_tokens().unwrap_or(0);
+            let pending = workers[idx].dispatched_uncached_tokens();
+            let cache_tokens = if workers[idx].url() == result.tenant.as_ref() {
+                cached_tokens
+            } else {
+                0
+            };
+            let uncached_tokens = request_tokens.saturating_sub(cache_tokens);
+            let cost = waiting_tokens.saturating_add(uncached_tokens);
+            per_worker.push((idx, cost, cache_tokens, uncached_tokens, snapshot, pending));
+        }
+
+        if per_worker.len() != healthy_indices.len() {
+            return None;
+        }
+
+        let selected = per_worker
             .iter()
-            .filter_map(|&idx| {
-                let waiting_tokens = workers[idx].estimated_waiting_uncached_tokens()?;
-                let cache_tokens = if workers[idx].url() == result.tenant.as_ref() {
-                    cached_tokens
-                } else {
-                    0
-                };
-                let uncached_tokens = request_tokens.saturating_sub(cache_tokens);
-                let cost = waiting_tokens.saturating_add(uncached_tokens);
-                Some((idx, cost, cache_tokens, uncached_tokens))
-            })
-            .min_by_key(|(_, cost, cache_tokens, _)| (*cost, std::cmp::Reverse(*cache_tokens)))
-            .map(|(idx, _, _, uncached_tokens)| (idx, uncached_tokens))
+            .min_by_key(|(_, cost, cache_tokens, _, _, _)| (*cost, std::cmp::Reverse(*cache_tokens)))
+            .copied();
+
+        if request_tokens >= COST_LOG_MIN_REQUEST_TOKENS {
+            if let Some((idx, _, _, _, _, _)) = selected {
+                let details: Vec<String> = per_worker
+                    .iter()
+                    .map(|(w_idx, cost, cache, _, snapshot, pending)| {
+                        format!(
+                            "{}:snapshot={},pending={},cached={},cost={}",
+                            workers[*w_idx].url(),
+                            snapshot,
+                            pending,
+                            cache,
+                            cost
+                        )
+                    })
+                    .collect();
+                info!(
+                    selected = workers[idx].url(),
+                    request_tokens,
+                    workers = %details.join("; "),
+                    "cost-aware routing decision"
+                );
+            }
+        }
+
+        selected.map(|(idx, _, _, uncached_tokens, _, _)| (idx, uncached_tokens))
     }
 
     fn select_worker_min_load(
@@ -501,6 +559,9 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 .flatten();
             let selected_idx = if let Some((idx, uncached_tokens)) = cost_selection {
                 workers[idx].add_dispatched_uncached_tokens(uncached_tokens);
+                if let Some(slot) = info.cost_uncached_tokens {
+                    slot.store(uncached_tokens, std::sync::atomic::Ordering::Relaxed);
+                }
                 Some(idx)
             } else if match_rate > self.config.cache_threshold {
                 // Cache hit path: find worker by URL (compare &str directly, no allocation)
@@ -1753,5 +1814,62 @@ mod tests {
 
         // Проверка
         assert_eq!(selected, Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_cost_aware_snapshot_zero_after_dispatch_keeps_pending() {
+        // Подготовка: длинный запрос ушёл на W0, снимок движка ещё 0.
+        let policy = cost_aware_policy();
+        let workers = cost_aware_workers();
+        policy.init_workers(&workers);
+        workers[0].set_waiting_uncached_tokens(Some(0));
+        workers[1].set_waiting_uncached_tokens(Some(0));
+        let long_tokens = vec![0; 400_000];
+        let first = SelectWorkerInfo {
+            request_text: Some("long cold prompt"),
+            tokens: Some(&long_tokens),
+            ..Default::default()
+        };
+        let short_tokens = vec![0; 72_000];
+        let second = SelectWorkerInfo {
+            request_text: Some("follow up cold"),
+            tokens: Some(&short_tokens),
+            ..Default::default()
+        };
+
+        // Действие
+        let first_selected = policy.select_worker(&workers, &first).await;
+        workers[0].set_waiting_uncached_tokens(Some(0));
+        workers[1].set_waiting_uncached_tokens(Some(0));
+        let second_selected = policy.select_worker(&workers, &second).await;
+
+        // Проверка
+        assert_eq!(first_selected, Some(0));
+        assert_eq!(second_selected, Some(1));
+        assert_eq!(workers[0].dispatched_uncached_tokens(), 400_000);
+        assert_eq!(workers[0].estimated_waiting_uncached_tokens(), Some(400_000));
+    }
+
+    #[test]
+    fn test_estimated_tokens_from_text_cyrillic_and_ascii_code() {
+        // Подготовка: кириллица ~1.5 символа/токен; ASCII-код ~4 символа/токен.
+        let cyrillic = "привет мир ".repeat(1000);
+        let code = "def foo(x):\n    return x + 1\n".repeat(200);
+
+        // Действие
+        let cyr_est = estimated_tokens_from_text(&cyrillic);
+        let code_est = estimated_tokens_from_text(&code);
+
+        // Проверка: ошибка к ожидаемым порядкам <= 25%.
+        let cyr_chars = cyrillic.chars().count();
+        let cyr_expected = (cyr_chars * 2).div_ceil(3); // ~1.5 chars/token
+        let cyr_err = (cyr_est as i64 - cyr_expected as i64).unsigned_abs() as f64
+            / cyr_expected as f64;
+        assert!(cyr_err <= 0.25, "cyrillic err={cyr_err} est={cyr_est} exp={cyr_expected}");
+
+        let code_expected = code.chars().count().div_ceil(4);
+        let code_err = (code_est as i64 - code_expected as i64).unsigned_abs() as f64
+            / code_expected as f64;
+        assert!(code_err <= 0.25, "code err={code_err} est={code_est} exp={code_expected}");
     }
 }
