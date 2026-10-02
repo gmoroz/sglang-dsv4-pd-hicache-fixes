@@ -68,6 +68,8 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
 )
 from sglang.srt.layers.attention.dsv4.indexer import (
     C4IndexerBackendMixin,
+    candidate_block_mask,
+    select_candidate_block_ids,
     select_candidate_blocks,
 )
 from sglang.srt.layers.attention.dsv4.metadata import (
@@ -1128,8 +1130,12 @@ class DeepseekV4AttnBackend(
         )
         self.has_c4: bool = 4 in self.present_ratios
         self.has_c128: bool = 128 in self.present_ratios
-        # Per-request candidate masks the candidate_source layer publishes for the
-        # index_source layers after it (torch indexer scratch).
+        # Per-request candidates the candidate_source layer publishes for the
+        # index_source layers after it (torch indexer scratch). Decode publishes a
+        # [rows, width] bool mask, the dense fp4 prefill a list of [rows_b, lc_b]
+        # bool masks, the torch prefill a list of [rows_b, topk_blocks] int32
+        # block ids (candidate_block_mask expands them); the tail cut in
+        # enter_late_layer_tail slices rows only, so it serves every layout.
         self.candidate_masks: Optional[List[torch.Tensor]] = None
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
 
@@ -3547,8 +3553,13 @@ class DeepseekV4AttnBackend(
         # A compressed position is visible once the query has passed its last token.
         compress_lens = (pos + 1) // ratio
         topk = indexer.index_topk
+        block_size = indexer.candidate_block_size
         publish = [] if indexer.is_candidate_source else None
         consume = self.candidate_masks if indexer.uses_candidates else None
+        if publish is not None:
+            # The previous forward's candidates are dead once this layer scores
+            # again; drop them before the new ones are built.
+            self.candidate_masks = None
         for b, r in enumerate(torch.unique_consecutive(req).tolist()):
             tok = (req == r).nonzero().squeeze(1)
             lens = compress_lens[tok]
@@ -3557,7 +3568,7 @@ class DeepseekV4AttnBackend(
                 # Consumers address masks by request position, including empty requests.
                 if publish is not None:
                     publish.append(
-                        torch.zeros(0, 0, dtype=torch.bool, device=pos.device)
+                        torch.zeros(0, 0, dtype=torch.int32, device=pos.device)
                     )
                 continue
             j = torch.arange(lc, device=pos.device)
@@ -3572,25 +3583,36 @@ class DeepseekV4AttnBackend(
                 1,
                 _TORCH_INDEXER_SCORE_BUDGET_BYTES // (q.shape[1] * lc * 2),
             )
-            masks = [] if publish is not None else None
+            # The candidate source publishes [rows, topk_blocks] int32 block ids
+            # rather than a [rows, lc] bool mask: the mask is chunk_rows x context
+            # bytes (8192 x 1M = 8 GiB, and the list plus torch.cat plus the
+            # previous forward's copy held three of them), the ids are 64 MiB
+            # whatever the context. Consumers expand a row chunk at a time.
+            blocks = None
+            if publish is not None:
+                num_blocks = (lc + block_size - 1) // block_size
+                blocks = torch.empty(
+                    (tok.numel(), min(indexer.candidate_topk_blocks, num_blocks)),
+                    dtype=torch.int32,
+                    device=pos.device,
+                )
             for start in range(0, tok.numel(), rows_per_chunk):
                 rows = slice(start, start + rows_per_chunk)
                 tok_c, lens_c = tok[rows], lens[rows]
                 s = indexer.scores(q[tok_c], index_k, weights[tok_c])
                 s = s.masked_fill(j[None, :] >= lens_c[:, None], -torch.inf)
-                if masks is not None:
-                    masks.append(
-                        select_candidate_blocks(
-                            s,
-                            lens_c[:, None],
-                            topk_blocks=indexer.candidate_topk_blocks,
-                            block_size=indexer.candidate_block_size,
-                        )
+                if blocks is not None:
+                    blocks[rows] = select_candidate_block_ids(
+                        s,
+                        lens_c[:, None],
+                        topk_blocks=indexer.candidate_topk_blocks,
+                        block_size=block_size,
                     )
                 elif consume is not None:
-                    s = s.masked_fill(~consume[b][rows], -torch.inf)
+                    keep = candidate_block_mask(consume[b][rows], lc, block_size)
+                    s = s.masked_fill(~keep, -torch.inf)
                 idx = s.topk(k, dim=-1, sorted=False).indices
-                if consume is not None and masks is None:
+                if consume is not None and blocks is None:
                     idx = _mask_topk_scores(s, idx)
                     idx = idx.masked_fill(idx < 0, lc)
                 idx = idx.sort(dim=-1).values
@@ -3600,8 +3622,8 @@ class DeepseekV4AttnBackend(
                 ).to(torch.int32)
                 if raw_indices is not None:
                     raw_indices[tok_c, :k] = torch.where(reach, idx, -1).to(torch.int32)
-            if masks is not None:
-                publish.append(torch.cat(masks) if len(masks) > 1 else masks[0])
+            if blocks is not None:
+                publish.append(blocks)
         if publish is not None:
             self.candidate_masks = publish
 

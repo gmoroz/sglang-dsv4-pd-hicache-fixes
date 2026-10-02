@@ -1129,6 +1129,27 @@ class C4Indexer(nn.Module):
         )
 
 
+def _candidate_block_topk(
+    logits: torch.Tensor,
+    compress_lens: torch.Tensor | int,
+    topk_blocks: int,
+    block_size: int,
+) -> torch.return_types.topk:
+    """Per-block amax of logits, the block holding the query's newest position
+    forced to +inf, then the topk_blocks best blocks per row."""
+    width = logits.size(-1)
+    scores = F.pad(logits, (0, -width % block_size), value=-torch.inf)
+    scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
+    num_blocks = scores.size(-1)
+
+    last = (compress_lens - 1) // block_size
+    scores = scores.masked_fill(
+        torch.arange(num_blocks, device=logits.device) == last, torch.inf
+    )
+
+    return scores.topk(min(topk_blocks, num_blocks), dim=-1)
+
+
 def select_candidate_blocks(
     logits: torch.Tensor,
     compress_lens: torch.Tensor | int,
@@ -1140,17 +1161,37 @@ def select_candidate_blocks(
     in logits, so an all -inf block means not reachable yet; the block holding the
     query's newest position is always kept."""
     width = logits.size(-1)
-    scores = F.pad(logits, (0, -width % block_size), value=-torch.inf)
-    scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
-    num_blocks = scores.size(-1)
-
-    last = (compress_lens - 1) // block_size
-    scores = scores.masked_fill(
-        torch.arange(num_blocks, device=logits.device) == last, torch.inf
-    )
-
-    top = scores.topk(min(topk_blocks, num_blocks), dim=-1)
-    keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(
-        -1, top.indices, top.values > -torch.inf
-    )
+    top = _candidate_block_topk(logits, compress_lens, topk_blocks, block_size)
+    num_blocks = (width + block_size - 1) // block_size
+    keep = torch.zeros(
+        (*logits.shape[:-1], num_blocks), dtype=torch.bool, device=logits.device
+    ).scatter_(-1, top.indices, top.values > -torch.inf)
     return keep.repeat_interleave(block_size, dim=-1)[..., :width]
+
+
+def select_candidate_block_ids(
+    logits: torch.Tensor,
+    compress_lens: torch.Tensor | int,
+    topk_blocks: int,
+    block_size: int,
+) -> torch.Tensor:
+    """The same selection as select_candidate_blocks, as [rows, min(topk_blocks,
+    num_blocks)] int32 block ids, -1 where the block is not kept (an all -inf
+    block). Its size does not grow with the context: candidate_block_mask
+    expands it back to the [rows, width] bool mask of select_candidate_blocks."""
+    top = _candidate_block_topk(logits, compress_lens, topk_blocks, block_size)
+    return top.indices.to(torch.int32).masked_fill_(~(top.values > -torch.inf), -1)
+
+
+def candidate_block_mask(
+    blocks: torch.Tensor, width: int, block_size: int
+) -> torch.Tensor:
+    """[rows, k] int32 block ids (-1 padded) -> [rows, width] bool mask over
+    positions, identical to what select_candidate_blocks returns for the logits
+    the ids were selected from."""
+    num_blocks = (width + block_size - 1) // block_size
+    keep = torch.zeros(
+        (*blocks.shape[:-1], num_blocks + 1), dtype=torch.bool, device=blocks.device
+    )
+    keep.scatter_(-1, blocks.to(torch.int64).masked_fill(blocks < 0, num_blocks), True)
+    return keep[..., :num_blocks].repeat_interleave(block_size, dim=-1)[..., :width]
