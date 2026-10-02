@@ -18,8 +18,8 @@ import triton.language as tl
 
 from sglang.kernels.ops.attention.dsv4.sm90_fp4_indexer import INDEX_HEAD_DIM
 
-# Measured best on H200 and RTX 5090 among 7 tiles. The grid walks query-row
-# blocks outermost so a row block's queries (BLOCK_M * heads * d bf16) stay in L2
+# Measured best on H200 among 7 swept tiles. The grid walks query-row blocks
+# outermost so a row block's queries (BLOCK_M * heads * d bf16) stay in L2
 # while the index K is streamed past them.
 _CONFIG = dict(BLOCK_M=64, BLOCK_N=128, num_warps=4, num_stages=2)
 
