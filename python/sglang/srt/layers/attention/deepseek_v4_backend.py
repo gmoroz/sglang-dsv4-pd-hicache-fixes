@@ -39,6 +39,9 @@ from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
 )
 from sglang.kernels.ops.attention.dsv4.online_c128_mtp import OnlineC128MTPController
 from sglang.kernels.ops.attention.dsv4.sm90_fp4_indexer import fp4_index_logits_decode
+from sglang.kernels.ops.attention.dsv4.sm90_fp4_indexer_prefill import (
+    fused_index_scores,
+)
 from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
     BuildCausalSwaPageIndices,
     BuildPageTablePositions,
@@ -3560,6 +3563,12 @@ class DeepseekV4AttnBackend(
             # The previous forward's candidates are dead once this layer scores
             # again; drop them before the new ones are built.
             self.candidate_masks = None
+        # The torch prefill indexer flag asks for the torch oracle, not this kernel.
+        fused = (
+            _is_cuda
+            and envs.SGLANG_OPT_USE_FUSED_DSV41_INDEXER_SCORES.get()
+            and not envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.get()
+        )
         for b, r in enumerate(torch.unique_consecutive(req).tolist()):
             tok = (req == r).nonzero().squeeze(1)
             lens = compress_lens[tok]
@@ -3579,10 +3588,10 @@ class DeepseekV4AttnBackend(
             k = min(topk, lc)
             # Every step below is per query row; chunk rows so the [rows, heads, lc]
             # bf16 scores stay under the budget (16 GiB at once for a 16k-token prompt).
-            rows_per_chunk = max(
-                1,
-                _TORCH_INDEXER_SCORE_BUDGET_BYTES // (q.shape[1] * lc * 2),
-            )
+            # The fused kernel holds only the fp32 [rows, lc] scores; at a quarter of
+            # the budget its [rows, lc] copies downstream stay under the torch peak.
+            row_bytes = lc * 16 if fused else q.shape[1] * lc * 2
+            rows_per_chunk = max(1, _TORCH_INDEXER_SCORE_BUDGET_BYTES // row_bytes)
             # The candidate source publishes [rows, topk_blocks] int32 block ids
             # rather than a [rows, lc] bool mask: the mask is chunk_rows x context
             # bytes (8192 x 1M = 8 GiB, and the list plus torch.cat plus the
@@ -3599,8 +3608,11 @@ class DeepseekV4AttnBackend(
             for start in range(0, tok.numel(), rows_per_chunk):
                 rows = slice(start, start + rows_per_chunk)
                 tok_c, lens_c = tok[rows], lens[rows]
-                s = indexer.scores(q[tok_c], index_k, weights[tok_c])
-                s = s.masked_fill(j[None, :] >= lens_c[:, None], -torch.inf)
+                if fused:
+                    s = fused_index_scores(q[tok_c], index_k, weights[tok_c], lens_c)
+                else:
+                    s = indexer.scores(q[tok_c], index_k, weights[tok_c])
+                    s = s.masked_fill(j[None, :] >= lens_c[:, None], -torch.inf)
                 if blocks is not None:
                     blocks[rows] = select_candidate_block_ids(
                         s,
